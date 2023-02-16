@@ -1,0 +1,166 @@
+---
+title: "boe_spending_cleaning"
+author: "Jon Meltzer"
+date: "2023-02-07"
+output: html_document
+---
+
+## Load libs
+```{r}
+library(tidyverse)
+library(janitor)
+```
+
+## Load data
+
+```{r}
+boe_data <- read_csv("C:/Users/Jon/Documents/GitHub/NewsApps_Spring23/boe_spending/schooldata.csv") %>% 
+  clean_names()
+```
+
+## Fix agency names & Baltimore City Only
+
+```{r}
+boe_baltimore <- boe_data %>% 
+  filter(str_detect(agency_name,"^Bal")) %>%
+  mutate(agency_name = case_when(
+    str_detect(agency_name,"Balitmore City Public Schools") ~ "Baltimore City Schools",
+    TRUE ~ agency_name
+  )) %>% 
+  filter(agency_name == "Baltimore City Schools")
+```
+
+## Cleaning in R
+
+```{r}
+# Make old column
+boe_baltimore <- boe_baltimore %>% 
+  rename(payee_name_old = payee_name) %>% 
+  mutate(payee_name = payee_name_old, .before = payee_name_old)
+
+# INC
+boe_baltimore_cleaned <- boe_baltimore %>% 
+  mutate(payee_name = toupper(payee_name)) %>% 
+  mutate(payee_name = case_when(
+    str_detect(payee_name,"INCORPORATED$") ~ str_replace(payee_name,"INCORPORATED$","INC"),
+    str_detect(payee_name,"INC.$") ~ str_replace(payee_name,"INC.$","INC"),
+    str_detect(payee_name,", INC$") ~ str_replace(payee_name,", INC$"," INC"),
+    str_detect(payee_name,",INC$") ~ str_replace(payee_name,",INC$","INC"),
+    TRUE ~ payee_name
+  ))
+
+# LLC
+boe_baltimore_cleaned <- boe_baltimore_cleaned %>% 
+  mutate(payee_name = toupper(payee_name)) %>% 
+  mutate(payee_name = case_when(
+    str_detect(payee_name,",LLC") ~ str_replace(payee_name,",LLC","LLC"),
+    str_detect(payee_name,", LLC") ~ str_replace(payee_name,", LLC"," LLC"),
+    TRUE ~ payee_name
+  ))
+```
+
+## Export for OpenRefine
+
+```{r}
+write_csv(boe_baltimore_cleaned,"boe_baltimore_unrefined.csv")
+```
+
+## Re-import & final touches
+
+```{r}
+boe_baltimore_refined <- read_csv("boe_baltimore_refined.csv")
+  
+boe_baltimore_final <- boe_baltimore_refined %>% 
+  #remove ALL commas
+  mutate(payee_name = str_replace_all(payee_name,",","")) %>% 
+  #fix PA
+  mutate(payee_name = str_replace_all(payee_name,"P\\.A\\.","PA")) %>%
+  mutate(payee_name = str_replace_all(payee_name,"P A ","PA")) %>% 
+  #remove all periods except those in web addresses
+  mutate(payee_name = str_replace_all(payee_name,"\\.","")) %>%
+  mutate(payee_name = str_replace_all(payee_name,"SCHOOLDUDECOM","SCHOOLDUDE.COM")) %>% 
+  #sneaky umbc!
+  mutate(payee_name = str_replace(payee_name,"UMBC","UNIVERSITY OF MARYLAND BALTIMORE COUNTY")) %>% 
+  #fix spacing
+  mutate(payee_name = str_squish(payee_name)) 
+```
+
+## Final export
+```{r}
+write_csv(boe_baltimore_final,"boe_baltimore_final.csv")
+```
+
+### Notes and Process
+
+My overall approach was manual cleaning in R, followed by a CSV export to cluster in OpenRefine, and a final pass back to R to make sure I didn't miss anything. I'm not sure how standardized you wanted us to get - I ended removing all punctuation that wasn't integral to the name of the vendor (i.e. 'SCHOOLDUDE.COM'). There were a couple mixes of "SO AND SO LLC" and "SO AND SO INC" - I Googled each name to see if I would get a different business. I never did, so I chalked it up to user error and clustered them. The cleaning I'm most proud of is the UMBC catch on the penultimate line. Almost got me! Think I got everything dialed in. Curious to know if you caught anything I didn't. This was great practice to get reacquainted with escape characters and RegEx in R.
+
+# Update - Finding Issues
+
+## Yearly purchases
+```{r}
+boe_by_year <- boe_baltimore_final %>% 
+  group_by(fiscal_year) %>% 
+  summarise(count=n()) %>% 
+  arrange(fiscal_year)
+
+boe_by_year
+
+ggplot(data = boe_by_year,aes(x = fiscal_year, y = count)) +
+  geom_line()
+```
+
+Okay first, off we are missing all the records for 2021. That's not good. It's not a state-wide problem, either. The raw data has plenty of records for other counties for 2021.
+
+Other than that, it looks like a pretty steady increase in number of purchases. Nothing crazy... let's check the dollar amounts.
+
+## Total money spent per year
+
+```{r}
+boe_dollars_by_year <- boe_baltimore_final %>% 
+  group_by(fiscal_year) %>% 
+  summarise(total=sum(amount)) %>% 
+  arrange(fiscal_year)
+
+boe_dollars_by_year
+
+ggplot(data = boe_dollars_by_year,aes(x = fiscal_year, y = total)) +
+  geom_line()
+```
+
+Okay, so there's a big dip in total dollars spent in 2020, even though there were more purchases made than in 2019. My guess is that there are missing payment amounts in 2020. Let's see about that.
+
+## Missing amounts
+
+```{r}
+boe_missing_amount_year <- boe_baltimore_final %>% 
+  group_by(fiscal_year) %>% 
+  summarise(missing=sum(is.na(amount)))
+
+# double check...
+
+colSums(is.na(boe_baltimore_final))
+```
+
+Interesting - no missing amounts. There goes my theory. Still worth check top payees by year.
+
+```{r}
+years <- unique(boe_baltimore_final$fiscal_year)
+  
+make_year_tables <- function(x){
+  dflist <- list()
+  for (year in x) {
+    table <- boe_baltimore_final %>%
+      filter(fiscal_year == year) %>%
+      group_by(payee_name) %>%
+      summarise(total_paid = sum(amount)) %>%
+      arrange(desc(total_paid)) %>% 
+      head(10)
+    dflist[[which(x == year)]] <- table
+  }
+  return(dflist)
+}
+
+make_year_tables(x = years)
+```
+
+The top two payees every year are healthcare insurance companies. I really don't see any alarming change here - lots of usual suspects (contractors, food service). I will say, the appearance of both Kipp Baltimore Inc and AFYA Baltimore, charter school companies, is worrying as a proponent of true public education. Sad state of affairs.
